@@ -1,0 +1,5 @@
+# Runtime artifacts written by the watchdog / robocopy
+watchdog.log
+last_result.txt
+robocopy-transfers.log
+robocopy-last.tmp
