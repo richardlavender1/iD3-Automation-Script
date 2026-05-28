@@ -15,7 +15,6 @@ Persistent
 ;    Ctrl+Alt+T   try the tray-click sequence only (for tuning)
 ;    Ctrl+Alt+P   trigger one result-poll cycle
 ;    Ctrl+Alt+M   dump the QuickSync tray menu items to the log
-;    Ctrl+Alt+S   send a test Slack ping (verify the webhook)
 ;    Ctrl+Alt+Q   quit the watchdog
 ; ==============================================================
 
@@ -81,22 +80,6 @@ TRAY_RIGHT_ARROWS_IN_FLYOUT := 2
 ; then M Down presses to highlight the iD3.
 MENU_DOWNS_TO_AVAILABLE_SERVICES := 4
 SUBMENU_DOWNS_TO_DEVICE          := 1
-
-; --- Slack notifications (direct message, status-change only) ---
-; The watchdog DMs you ONLY when the pipeline status changes — OK -> recovering
-; -> iD3 down -> export failing -> back to OK — so you're never spammed by a ping
-; per plate or a ping every retry. A stuck plate or an ongoing recovery pings
-; once. It runs on the unattended automation PC, so it can't use a desktop Slack
-; app — it calls the Slack Web API (chat.postMessage) with a bot token. Setup:
-;   1. Create a Slack app at api.slack.com/apps ("From scratch"), in your workspace.
-;   2. OAuth & Permissions -> Bot Token Scopes: add  chat:write  and  im:write
-;   3. Install to Workspace; copy the "Bot User OAuth Token" (starts with xoxb-).
-;   4. Paste it into SLACK_BOT_TOKEN below.
-; SLACK_DM_USER_ID is your Slack member ID (already filled in). Leave the token
-; "" to disable Slack entirely. Test the wiring with Ctrl+Alt+S.
-; NOTE: the token is a secret — keep this .ahk off any shared/public location.
-SLACK_BOT_TOKEN        := ""              ; xoxb-... ; "" = Slack off
-SLACK_DM_USER_ID       := "U0AJNQUS4SU"   ; Richard's Slack member ID (DM target)
 ; ---------------- end CONFIG ----------------------------------
 
 DISCONNECT_PATTERNS := [
@@ -117,7 +100,6 @@ global PrevPhase          := "WATCHING"  ; phase to restore to when the active o
 global PhaseStartTick     := 0           ; A_TickCount when the active phase began
 global PhaseStartStamp    := ""          ; wall-clock stamp when the active phase began
 global LastPollIssueTick  := 0           ; rate-limits "couldn't open menu" style notes
-global CurrentStatus      := ""          ; last Slack-reported pipeline status; DM only on change
 
 ; ---------------- ENTRY ---------------------------------------
 PhaseStartTick := A_TickCount
@@ -145,7 +127,6 @@ SetTimer(CheckConnectionHealth, CONNECTION_HEALTH_POLL_MS)
 SetTimer(Heartbeat, HEARTBEAT_LOG_MS)
 ; Startup complete — close the STARTUP banner and settle into the WATCHING phase.
 PhaseEnd()
-SetStatus("OK", "QuickSync watchdog started on " . A_ComputerName . " — status OK")
 return
 
 ^!r:: {
@@ -164,10 +145,6 @@ return
     WatchdogLog("--- Menu read diagnostic ---")
     DumpQuickSyncMenuItems()
     WatchdogLog("--- Menu read diagnostic end ---")
-}
-^!s:: {
-    WatchdogLog("Manual Slack test triggered via hotkey")
-    SlackNotify("Test ping from QuickSync watchdog on " . A_ComputerName)
 }
 ^!q:: {
     WatchdogLog("=== watchdog stopping (hotkey) ===")
@@ -236,8 +213,6 @@ RecoverFromDisconnect() {
         return
     Recovering := true
     PhaseBegin("RECOVERY")
-    SetStatus("RECOVERING", "iD3 connection lost — recovering on " . A_ComputerName . "...")
-    launchFailed := false
     try {
         WaitForPing(IID3_IP)
         WaitForServicePort(IID3_IP, SERVICE_PORT)
@@ -250,17 +225,13 @@ RecoverFromDisconnect() {
             Run QUICKSYNC_EXE, qsDir
         } catch as e {
             WatchdogLog("ERROR: could not launch QuickSync: " . e.Message)
-            launchFailed := true
-            SetStatus("RECOVERY_FAILED", ":warning: Recovery could NOT launch QuickSync on " . A_ComputerName . ": " . e.Message)
             return
         }
         WaitForDiscovery()
         Sleep POST_DISCOVERY_PAUSE_MS
         OpenQuickSyncTrayMenuAndConnect()
     } finally {
-        dur := PhaseEnd()
-        if (!launchFailed)
-            SetStatus("OK", "Recovered on " . A_ComputerName . " after " . dur . " — back to OK")
+        PhaseEnd()
         Recovering := false
     }
 }
@@ -518,12 +489,11 @@ CheckConnectionHealth() {
     if (nowReachable && !LastReachable) {
         WatchdogRaw("[HEALTH] iD3 came back online (down->up) — triggering recovery")
         LastReachable := true
-        RecoverFromDisconnect()   ; this flips status to RECOVERING (one DM)
+        RecoverFromDisconnect()
         return
     }
     if (!nowReachable && LastReachable) {
         WatchdogRaw("[HEALTH] iD3 became unreachable (up->down) — waiting for it to return")
-        SetStatus("iD3_DOWN", ":warning: iD3 unreachable on " . A_ComputerName . " — waiting for it to return")
         LastReachable := false
         return
     }
@@ -624,13 +594,10 @@ PollForNewResult() {
             WatchdogLog("EXPORTED (Excel launched after click; killing it so the pickup file is released)")
             KillProcess("EXCEL.EXE")
             SaveLastResult(filename)
-            SetStatus("OK", "Exports recovered on " . A_ComputerName . " — " . filename . " went through")
         } else if (excelNowRunning && excelWasRunningBefore) {
             WatchdogLog("WARN: Excel already running before click — can't confirm export; will retry next tick")
-            SetStatus("EXPORT_FAILING", ":warning: Exports failing on " . A_ComputerName . " — " . filename . " unconfirmed (Excel already open), retrying")
         } else {
             WatchdogLog("WARN: clicked but no Excel appeared — pickup file likely NOT written; will retry next tick")
-            SetStatus("EXPORT_FAILING", ":warning: Exports failing on " . A_ComputerName . " — " . filename . " no file written, retrying")
         }
     } finally {
         PhaseEnd()
@@ -780,55 +747,6 @@ WatchdogRaw(line) {
         FileAppend ts . "  " . line . "`n", WATCHDOG_LOG
     } catch {
     }
-}
-
-; ==============================================================
-;  Slack notifications (status-change DMs via chat.postMessage)
-; ==============================================================
-; SetStatus DMs you ONLY when the pipeline status actually changes, so a stuck
-; plate or an ongoing recovery pings once — staying in the same status is silent.
-; Status values: OK / RECOVERING / RECOVERY_FAILED / iD3_DOWN / EXPORT_FAILING.
-SetStatus(newStatus, slackText) {
-    global CurrentStatus
-    if (newStatus = CurrentStatus)
-        return
-    CurrentStatus := newStatus
-    SlackNotify(slackText)
-}
-
-; Low-level DM — sends unconditionally (used by SetStatus and the test hotkey).
-; A failed call is logged but never throws — Slack being down must not affect the
-; watchdog. Short timeouts so a slow API call can't stall a recovery/poll.
-SlackNotify(text) {
-    global SLACK_BOT_TOKEN, SLACK_DM_USER_ID
-    if (SLACK_BOT_TOKEN = "" || SLACK_DM_USER_ID = "")
-        return
-    try {
-        body := '{"channel":"' . SLACK_DM_USER_ID . '","text":"' . SlackEscape(text) . '"}'
-        req := ComObject("WinHttp.WinHttpRequest.5.1")
-        req.SetTimeouts(2000, 2000, 2000, 4000)  ; resolve, connect, send, receive (ms)
-        req.Open("POST", "https://slack.com/api/chat.postMessage", false)
-        req.SetRequestHeader("Content-Type", "application/json; charset=utf-8")
-        req.SetRequestHeader("Authorization", "Bearer " . SLACK_BOT_TOKEN)
-        req.Send(body)
-        ; Slack answers HTTP 200 with {"ok":false,"error":"..."} on logical errors
-        ; (invalid_auth, channel_not_found, missing scope, ...) — surface those so
-        ; setup is debuggable instead of silently dropping pings.
-        if (req.Status != 200 || InStr(req.ResponseText, '"ok":false'))
-            WatchdogLog("WARN: Slack DM not delivered (HTTP " . req.Status . "): " . req.ResponseText)
-    } catch as e {
-        WatchdogLog("WARN: Slack notify failed: " . e.Message)
-    }
-}
-
-; JSON-escapes a string for embedding in the webhook payload.
-SlackEscape(s) {
-    s := StrReplace(s, "\", "\\")
-    s := StrReplace(s, '"', '\"')
-    s := StrReplace(s, "`r", "")
-    s := StrReplace(s, "`n", "\n")
-    s := StrReplace(s, "`t", " ")
-    return s
 }
 
 ; ==============================================================
