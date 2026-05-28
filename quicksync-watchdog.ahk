@@ -49,6 +49,13 @@ RESULT_POLL_MS         := 20000        ; check for a new result every 20s
 EXCEL_KILL_DELAY_MS    := 5000         ; let Excel save the file before killing
 ENABLE_RESULT_POLLING  := true         ; smart polling enabled — only clicks when filename changes
 LAST_RESULT_FILE       := A_ScriptDir . "\last_result.txt"  ; persisted last-seen filename
+; Hung-export guard. Once QS surfaces a new result we start a clock; if we
+; don't successfully export it within this window QS is sitting in the
+; "infinite loading" state after detection, which only a relaunch unsticks.
+; Time-based (not attempt-count) so it catches every failure shape — menu
+; won't open, click silently dropped, Excel never launches — uniformly.
+; 60s ≈ 3 poll cycles' worth of failed attempts before we escalate.
+EXPORT_HUNG_TIMEOUT_MS := 60000
 
 ; --- Connection-health heartbeat ---
 ; Belt-and-braces for the case where QuickSync sits in a stale "connected"
@@ -92,6 +99,8 @@ DISCOVERY_OK_PATTERN := "Service Discovery finished\. Services found: [1-9]"
 global LogPosition        := 0     ; bytes we've already consumed from QS log
 global Recovering         := false ; guard against re-entering recovery mid-flight
 global LastResultSeen     := ""    ; last "Open Last Result: <name>" we processed
+global PendingResult      := ""    ; result currently being exported (set on first sighting, cleared on success/escalation)
+global PendingResultStartTick := 0 ; A_TickCount when PendingResult was first seen — drives the hung-export timeout
 global LastReachable      := true  ; last TCP probe result for the iD3 service port
 
 ; --- Phase tracking (drives the phase tag + begin/end banners in the log) ---
@@ -208,7 +217,7 @@ PollLog() {
 ;  Recovery state machine
 ; ==============================================================
 RecoverFromDisconnect() {
-    global Recovering, IID3_IP, SERVICE_PORT, QUICKSYNC_EXE
+    global Recovering, IID3_IP, SERVICE_PORT, QUICKSYNC_EXE, PendingResult, PendingResultStartTick
     if (Recovering)
         return
     Recovering := true
@@ -231,6 +240,11 @@ RecoverFromDisconnect() {
         Sleep POST_DISCOVERY_PAUSE_MS
         OpenQuickSyncTrayMenuAndConnect()
     } finally {
+        ; QS state is fresh after recovery — any in-flight pending tracking is
+        ; stale. If the same result is still queued the next poll re-detects it
+        ; and restarts the clock; if not, we move on cleanly.
+        PendingResult := ""
+        PendingResultStartTick := 0
         PhaseEnd()
         Recovering := false
     }
@@ -509,11 +523,23 @@ CheckConnectionHealth() {
 ;  new timestamped Excel file in the pickup folder, so blind polling would
 ;  dupe the same plate read every tick — hence the filename gate.
 PollForNewResult() {
-    global Recovering, LastResultSeen, EXCEL_KILL_DELAY_MS
+    global Recovering, LastResultSeen, EXCEL_KILL_DELAY_MS, PendingResult, PendingResultStartTick, EXPORT_HUNG_TIMEOUT_MS
     if (Recovering)
         return
     if (!ProcessExist("QuickSync.exe"))
         return
+
+    ; Hung-export check. If a previous tick set PendingResult and we still
+    ; haven't successfully exported within EXPORT_HUNG_TIMEOUT_MS, QS is in
+    ; the post-detection "infinite loading" state. Only known unstick is a
+    ; relaunch — RecoverFromDisconnect handles that and clears PendingResult
+    ; in its finally block, so the next poll starts fresh.
+    if (PendingResult != "" && (A_TickCount - PendingResultStartTick) > EXPORT_HUNG_TIMEOUT_MS) {
+        hungFor := FormatDuration((A_TickCount - PendingResultStartTick) // 1000)
+        WatchdogLog("Hung export: '" . PendingResult . "' not exported within " . hungFor . " — escalating to recovery")
+        RecoverFromDisconnect()
+        return
+    }
 
     ; Open QS context menu ONCE — we read items in-place and navigate by
     ; index without ever closing the menu between the read and the click.
@@ -562,6 +588,15 @@ PollForNewResult() {
     ; attempt reads as one delimited block with a time range, then handle it.
     PhaseBegin("RESULT-POLL")
     try {
+        ; Start (or restart) the hung-export clock. First sighting → start.
+        ; Different filename than pending (newer plate jumped the queue) → restart.
+        ; Same filename across retries → keep clock running.
+        if (filename != PendingResult) {
+            PendingResult := filename
+            PendingResultStartTick := A_TickCount
+            WatchdogLog("Pending export: " . filename . " (hung-timeout " . (EXPORT_HUNG_TIMEOUT_MS // 1000) . "s)")
+        }
+
         prev := (LastResultSeen = "") ? "none" : LastResultSeen
         WatchdogLog("new result: " . filename . " (previous: " . prev . ", menu idx " . targetIdx . ")")
 
@@ -594,6 +629,8 @@ PollForNewResult() {
             WatchdogLog("EXPORTED (Excel launched after click; killing it so the pickup file is released)")
             KillProcess("EXCEL.EXE")
             SaveLastResult(filename)
+            PendingResult := ""
+            PendingResultStartTick := 0
         } else if (excelNowRunning && excelWasRunningBefore) {
             WatchdogLog("WARN: Excel already running before click — can't confirm export; will retry next tick")
         } else {
@@ -778,13 +815,18 @@ PhaseEnd() {
 ; genuinely idle (WATCHING) — never mid-recovery or mid-result-poll — so it
 ; adds at most one line per HEARTBEAT_LOG_MS and never spams.
 Heartbeat() {
-    global Recovering, CurrentPhase, LastReachable, LastResultSeen
+    global Recovering, CurrentPhase, LastReachable, LastResultSeen, PendingResult, PendingResultStartTick
     if (Recovering || CurrentPhase != "WATCHING")
         return
     qs := ProcessExist("QuickSync.exe") ? "running" : "NOT running"
     reach := LastReachable ? "reachable" : "UNREACHABLE"
     lr := (LastResultSeen = "") ? "none" : LastResultSeen
-    WatchdogLog("idle - iD3 " . reach . ", QuickSync " . qs . ", last result " . lr)
+    pending := ""
+    if (PendingResult != "") {
+        pendingFor := FormatDuration((A_TickCount - PendingResultStartTick) // 1000)
+        pending := ", pending " . PendingResult . " (" . pendingFor . ")"
+    }
+    WatchdogLog("idle - iD3 " . reach . ", QuickSync " . qs . ", last result " . lr . pending)
 }
 
 ; Rate-limited note for result-poll anomalies (menu won't open / unreadable).
